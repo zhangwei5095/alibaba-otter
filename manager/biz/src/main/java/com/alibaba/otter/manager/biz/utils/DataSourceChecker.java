@@ -109,6 +109,7 @@ public class DataSourceChecker {
         }
     }
 
+    @SuppressWarnings("resource")
     public String check(String url, String username, String password, String encode, String sourceType) {
         Connection conn = null;
         Statement stmt = null;
@@ -146,6 +147,7 @@ public class DataSourceChecker {
             try {
                 conn = dataSource.getConnection();
             } catch (Exception e) {
+                logger.error("check error!", e);
             }
 
             if (null == conn) {

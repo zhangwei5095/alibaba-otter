@@ -18,10 +18,7 @@ package com.alibaba.otter.node.etl.select.selector.canal;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
@@ -45,19 +42,16 @@ import com.alibaba.otter.canal.parse.inbound.mysql.MysqlEventParser;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
 import com.alibaba.otter.canal.protocol.CanalEntry.Entry;
 import com.alibaba.otter.canal.protocol.ClientIdentity;
-import com.alibaba.otter.canal.server.embeded.CanalServerWithEmbeded;
+import com.alibaba.otter.canal.server.embedded.CanalServerWithEmbedded;
 import com.alibaba.otter.canal.sink.AbstractCanalEventSink;
 import com.alibaba.otter.canal.sink.CanalEventSink;
 import com.alibaba.otter.node.common.config.ConfigClientService;
 import com.alibaba.otter.node.etl.OtterConstants;
 import com.alibaba.otter.node.etl.OtterContextLocator;
-import com.alibaba.otter.node.etl.select.exceptions.SelectException;
 import com.alibaba.otter.node.etl.select.selector.Message;
 import com.alibaba.otter.node.etl.select.selector.MessageDumper;
 import com.alibaba.otter.node.etl.select.selector.MessageParser;
 import com.alibaba.otter.node.etl.select.selector.OtterSelector;
-import com.alibaba.otter.shared.common.model.config.data.DataMedia.ModeValue;
-import com.alibaba.otter.shared.common.model.config.data.DataMediaPair;
 import com.alibaba.otter.shared.common.model.config.pipeline.Pipeline;
 import com.alibaba.otter.shared.etl.model.EventData;
 
@@ -69,34 +63,34 @@ import com.alibaba.otter.shared.etl.model.EventData;
  */
 public class CanalEmbedSelector implements OtterSelector {
 
-    private static final Logger    logger           = LoggerFactory.getLogger(CanalEmbedSelector.class);
-    private static final String    SEP              = SystemUtils.LINE_SEPARATOR;
-    private static final String    DATE_FORMAT      = "yyyy-MM-dd HH:mm:ss";
-    private static final int       maxEmptyTimes    = 10;
-    private int                    logSplitSize     = 50;
-    private boolean                dump             = true;
-    private boolean                dumpDetail       = true;
-    private Long                   pipelineId;
-    private CanalServerWithEmbeded canalServer;
-    private ClientIdentity         clientIdentity;
-    private MessageParser          messageParser;
-    private ConfigClientService    configClientService;
-    private OtterDownStreamHandler handler;
+    private static final Logger     logger           = LoggerFactory.getLogger(CanalEmbedSelector.class);
+    private static final String     SEP              = SystemUtils.LINE_SEPARATOR;
+    private static final String     DATE_FORMAT      = "yyyy-MM-dd HH:mm:ss";
+    private static final int        maxEmptyTimes    = 10;
+    private int                     logSplitSize     = 50;
+    private boolean                 dump             = true;
+    private boolean                 dumpDetail       = true;
+    private Long                    pipelineId;
+    private CanalServerWithEmbedded canalServer;
+    private ClientIdentity          clientIdentity;
+    private MessageParser           messageParser;
+    private ConfigClientService     configClientService;
+    private OtterDownStreamHandler  handler;
 
-    private String                 destination;
-    private String                 filter;
-    private int                    batchSize        = 10000;
-    private long                   batchTimeout     = -1L;
-    private boolean                ddlSync          = true;
-    private boolean                filterTableError = false;
+    private String                  destination;
+    private String                  filter;
+    private int                     batchSize        = 10000;
+    private long                    batchTimeout     = -1L;
+    private boolean                 ddlSync          = true;
+    private boolean                 filterTableError = false;
 
-    private CanalConfigClient      canalConfigClient;
-    private volatile boolean       running          = false;                                            // 是否处于运行中
-    private volatile long          lastEntryTime    = 0;
+    private CanalConfigClient       canalConfigClient;
+    private volatile boolean        running          = false;                                            // 是否处于运行中
+    private volatile long           lastEntryTime    = 0;
 
     public CanalEmbedSelector(Long pipelineId){
         this.pipelineId = pipelineId;
-        canalServer = new CanalServerWithEmbeded();
+        canalServer = new CanalServerWithEmbedded();
     }
 
     public boolean isStart() {
@@ -109,11 +103,13 @@ public class CanalEmbedSelector implements OtterSelector {
         }
         // 获取destination/filter参数
         Pipeline pipeline = configClientService.findPipeline(pipelineId);
-        filter = makeFilterExpression(pipeline);
+        filter = CanalFilterSupport.makeFilterExpression(pipeline);
         destination = pipeline.getParameters().getDestinationName();
         batchSize = pipeline.getParameters().getMainstemBatchsize();
         batchTimeout = pipeline.getParameters().getBatchTimeout();
         ddlSync = pipeline.getParameters().getDdlSync();
+        final boolean syncFull = pipeline.getParameters().getSyncMode().isRow()
+                                 || pipeline.getParameters().isEnableRemedy();
         // 暂时使用skip load代替
         filterTableError = pipeline.getParameters().getSkipSelectException();
         if (pipeline.getParameters().getDumpSelector() != null) {
@@ -158,6 +154,14 @@ public class CanalEmbedSelector implements OtterSelector {
                         super.startEventParserInternal(parser, isGroup);
 
                         if (eventParser instanceof MysqlEventParser) {
+                            // 设置支持的类型
+                            ((MysqlEventParser) eventParser).setSupportBinlogFormats("ROW");
+                            if (syncFull) {
+                                ((MysqlEventParser) eventParser).setSupportBinlogImages("FULL");
+                            } else {
+                                ((MysqlEventParser) eventParser).setSupportBinlogImages("FULL,MINIMAL");
+                            }
+
                             MysqlEventParser mysqlEventParser = (MysqlEventParser) eventParser;
                             CanalHAController haController = mysqlEventParser.getHaController();
 
@@ -327,88 +331,6 @@ public class CanalEmbedSelector implements OtterSelector {
             }
             index += logSplitSize;
         } while (index < size);
-    }
-
-    /**
-     * 构建filter 表达式
-     */
-    private String makeFilterExpression(Pipeline pipeline) {
-        List<DataMediaPair> dataMediaPairs = pipeline.getPairs();
-        if (dataMediaPairs.isEmpty()) {
-            throw new SelectException("ERROR ## the pair is empty,the pipeline id = " + pipeline.getId());
-        }
-
-        Set<String> mediaNames = new HashSet<String>();
-        for (DataMediaPair dataMediaPair : dataMediaPairs) {
-            ModeValue namespaceMode = dataMediaPair.getSource().getNamespaceMode();
-            ModeValue nameMode = dataMediaPair.getSource().getNameMode();
-
-            if (namespaceMode.getMode().isSingle()) {
-                buildFilter(mediaNames, namespaceMode.getSingleValue(), nameMode, false);
-            } else if (namespaceMode.getMode().isMulti()) {
-                for (String namespace : namespaceMode.getMultiValue()) {
-                    buildFilter(mediaNames, namespace, nameMode, false);
-                }
-            } else if (namespaceMode.getMode().isWildCard()) {
-                buildFilter(mediaNames, namespaceMode.getSingleValue(), nameMode, true);
-            }
-        }
-
-        StringBuilder result = new StringBuilder();
-        Iterator<String> iter = mediaNames.iterator();
-        int i = -1;
-        while (iter.hasNext()) {
-            i++;
-            if (i == 0) {
-                result.append(iter.next());
-            } else {
-                result.append(",").append(iter.next());
-            }
-        }
-
-        String markTable = pipeline.getParameters().getSystemSchema() + "."
-                           + pipeline.getParameters().getSystemMarkTable();
-        String bufferTable = pipeline.getParameters().getSystemSchema() + "."
-                             + pipeline.getParameters().getSystemBufferTable();
-        String dualTable = pipeline.getParameters().getSystemSchema() + "."
-                           + pipeline.getParameters().getSystemDualTable();
-
-        if (!mediaNames.contains(markTable)) {
-            result.append(",").append(markTable);
-        }
-
-        if (!mediaNames.contains(bufferTable)) {
-            result.append(",").append(bufferTable);
-        }
-
-        if (!mediaNames.contains(dualTable)) {
-            result.append(",").append(dualTable);
-        }
-
-        // String otterTable = pipeline.getParameters().getSystemSchema() +
-        // "\\..*";
-        // if (!mediaNames.contains(otterTable)) {
-        // result.append(",").append(otterTable);
-        // }
-
-        return result.toString();
-    }
-
-    private void buildFilter(Set<String> mediaNames, String namespace, ModeValue nameMode, boolean wildcard) {
-        String splitChar = ".";
-        if (wildcard) {
-            splitChar = "\\.";
-        }
-
-        if (nameMode.getMode().isSingle()) {
-            mediaNames.add(namespace + splitChar + nameMode.getSingleValue());
-        } else if (nameMode.getMode().isMulti()) {
-            for (String name : nameMode.getMultiValue()) {
-                mediaNames.add(namespace + splitChar + name);
-            }
-        } else if (nameMode.getMode().isWildCard()) {
-            mediaNames.add(namespace + "\\." + nameMode.getSingleValue());
-        }
     }
 
     // 处理无数据的情况，避免空循环挂死
